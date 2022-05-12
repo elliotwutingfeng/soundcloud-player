@@ -1,28 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { Pause, PlayArrow, SkipNext, SkipPrevious } from "@mui/icons-material";
 import { Button } from "@mui/material";
 import "./App.css";
-
-function SongThumbnail({ url }) {
-  return <img src={url} alt="song_thumbnail" width="200px" height="200px" />;
-}
-
-function SongTitle({ title }) {
-  return (
-    <p>
-      <b>Title:</b> {title}
-    </p>
-  );
-}
-
-function Artist({ name }) {
-  return (
-    <p>
-      <b>Artist:</b> {name}
-    </p>
-  );
-}
+import loadscript from "load-script";
 
 function PreviousTrackButton({ onClick }) {
   return (
@@ -53,100 +34,138 @@ function NextTrackButton({ onClick }) {
   );
 }
 
-function getPreviousSongURL(songURL, songURLs) {
-  const currIdx = songURLs.findIndex((url) => url === songURL);
-  return songURLs.at(currIdx === 0 ? -1 : currIdx - 1);
-}
-
-function getNextSongURL(songURL, songURLs) {
-  const currIdx = songURLs.findIndex((url) => url === songURL);
-  return songURLs.at(currIdx === songURLs.length - 1 ? 0 : currIdx + 1);
-}
-
 function App() {
-  const songURLs = [
-    "https://soundcloud.com/poolhouseltd/vhs-dreams-meet-her-at-the-plaza",
-    "https://soundcloud.com/eumigandchinon/pelle-g-childish-delight-eumig",
-    "https://soundcloud.com/user-790028988/01-distant-dream-sleeping",
-  ];
-  const [songURL, setSongURL] = useState(songURLs[0]); // song urls
   const [songTitle, setSongTitle] = useState(null);
   const [songArtist, setSongArtist] = useState(null);
-  const [songThumbnailURL, setSongThumbnailURL] = useState(null);
-  const [play, setPlay] = useState(false);
+  const [songPosition, setSongPosition] = useState(0);
+  const [songDuration, setSongDuration] = useState("-");
+
+  // used to communicate between SC widget and React
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [playlistIndex, setPlaylistIndex] = useState(0);
+
+  // populated once SoundCloud Widget API is loaded and initialized
+  const [player, setPlayer] = useState(false);
+  // ref for iframe element - https://reactjs.org/docs/refs-and-the-dom.html
+  const iframeRef = useRef();
+
+  // initialization - load soundcloud widget API and set SC event listeners
 
   useEffect(() => {
-    async function getSCinfo(songURL) {
-      const scUrl = `https://soundcloud.com/oembed.json?maxheight=200&url=${songURL}`; // TODO remove maxheight=200&
-      const res = await fetch(scUrl);
-      const data = await res.json();
+    // use load-script module to load SC Widget API
+    loadscript("https://w.soundcloud.com/player/api.js", () => {
+      // initialize player and store reference in state
+      const player = window.SC.Widget(iframeRef.current);
+      setPlayer(player);
+      const { PLAY, PLAY_PROGRESS, PAUSE } = window.SC.Widget.Events;
 
-      const thumbnail_url = data.thumbnail_url.replace(
-        /^http:\/\//i,
-        "https://"
-      );
-      const [songTitle, songArtist] = data.title
-        .split("by")
-        .map((a) => a.trim());
+      // NOTE: closures created - cannot access react state or props from within and SC callback functions!!
 
-      setSongThumbnailURL(thumbnail_url);
-      setSongTitle(songTitle);
-      setSongArtist(songArtist);
-    }
-    getSCinfo(songURL, "thumbnail", true, true);
+      player.bind(PLAY_PROGRESS, (e) => {
+        player.getDuration((duration) => {
+          setSongDuration(duration);
+        });
+        setSongPosition(e.currentPosition);
+        player.getCurrentSound((currentSound) => {
+          setSongTitle(currentSound.title);
+          setSongArtist(currentSound.user.username);
+        });
+      });
 
-    // Ensure that play/pause button state always matches soundcloud widget play/pause state
-    const SC = window.SC.Widget("so");
-    SC.bind(window.SC.Widget.Events.PLAY, function () {
-      setPlay(true);
+      player.bind(PLAY, () => {
+        // update state to playing
+        setIsPlaying(true);
+        // check to see if song has changed - if so update state with next index
+        player.getCurrentSoundIndex((playerPlaylistIndex) => {
+          setPlaylistIndex(playerPlaylistIndex);
+        });
+      });
+
+      player.bind(PAUSE, () => {
+        // update state if player has paused - must double check isPaused since false positives
+        player.isPaused((playerIsPaused) => {
+          if (playerIsPaused) setIsPlaying(false);
+        });
+      });
     });
-    SC.bind(window.SC.Widget.Events.PAUSE, function () {
-      setPlay(false);
+  }, []);
+
+  // integration - update SC player based on new state (e.g. play button in React section was click)
+
+  // adjust playback in SC player to match isPlaying state
+  useEffect(() => {
+    if (!player) return; // player loaded async - make sure available
+
+    player.isPaused((playerIsPaused) => {
+      if (isPlaying && playerIsPaused) {
+        player.play();
+      } else if (!isPlaying && !playerIsPaused) {
+        player.pause();
+      }
     });
-  }, [songURL]);
+  }, [player, isPlaying]);
+
+  // adjust seleted song in SC player playlist if playlistIndex state has changed
+  useEffect(() => {
+    if (!player) return; // player loaded async - make sure available
+    player.getCurrentSoundIndex((playerPlaylistIndex) => {
+      if (playerPlaylistIndex !== playlistIndex) player.skip(playlistIndex);
+    });
+  }, [player, playlistIndex]);
+
+  // React section button click event handlers (play/next/previous)
+  //  - adjust React component state based on click events
+
+  const togglePlayback = () => {
+    setIsPlaying(!isPlaying);
+  };
+
+  const changePlaylistIndex = (skipForward = true) => {
+    // get list of songs from SC widget
+    player.getSounds((playerSongList) => {
+      let nextIndex = skipForward ? playlistIndex + 1 : playlistIndex - 1;
+
+      // ensure index is not set to less than 0 or greater than playlist
+      if (nextIndex < 0) {
+        nextIndex = playerSongList.length - 1;
+      } else if (nextIndex >= playerSongList.length) {
+        nextIndex = 0;
+      }
+      setPlaylistIndex(nextIndex);
+    });
+  };
 
   return (
     <div className="App">
-      <SongThumbnail url={songThumbnailURL} />
-      <SongTitle title={songTitle} />
-      <Artist name={songArtist} />
-      <PreviousTrackButton
-        onClick={() =>
-          setSongURL((songURL) => getPreviousSongURL(songURL, songURLs))
+      <iframe
+        title="so"
+        hidden
+        ref={iframeRef}
+        id="sound-cloud-player"
+        style={{ border: "none", height: 314, width: 400 }}
+        scrolling="no"
+        allow="autoplay"
+        src={
+          "https://w.soundcloud.com/player/?url=https://soundcloud.com/user-770890652/sets/player-demo"
         }
-      />
+      ></iframe>
 
-      <PlayPauseButton
-        play={play}
-        onClick={() => {
-          const SC = window.SC.Widget("so");
-          if (play) {
-            SC.pause();
-          } else {
-            SC.play();
-          }
-          setPlay((status) => !status);
-        }}
-      />
-      <NextTrackButton
-        onClick={() => {
-          setSongURL((songURL) => getNextSongURL(songURL, songURLs));
-        }}
-      />
+      <div className="react-section">
+        <h3>React Audio Player</h3>
 
-      <div id="player" hidden>
-        <iframe
-          title="so"
-          id="so"
-          width="100%"
-          height="100%"
-          scrolling="no"
-          frameBorder="0"
-          allow="autoplay"
-          src={`https://w.soundcloud.com/player/?url=${songURL}&auto_play=true`}
-        >
-          Loading
-        </iframe>
+        <p>Title: {songTitle ?? "-"}</p>
+        <p>Artist: {songArtist ?? "-"}</p>
+
+        <p>
+          {new Date(Math.round(songPosition)).toISOString().substring(14, 19)} /{" "}
+          {songDuration !== "-"
+            ? new Date(Math.round(songDuration)).toISOString().substring(14, 19)
+            : "-"}
+        </p>
+
+        <PreviousTrackButton onClick={() => changePlaylistIndex(false)} />
+        <PlayPauseButton play={isPlaying} onClick={togglePlayback} />
+        <NextTrackButton onClick={() => changePlaylistIndex(true)} />
       </div>
     </div>
   );
